@@ -1,0 +1,6 @@
+{
+    "configuration": "LTO=enable,TimerClockSource=default,sketchclock=165pll,bod=disable,millis=enabled,burnmode=upgrade,resetpin=reset",
+    "board": "ATTinyCore:avr:attinyx5micr",
+    "programmer": "micronucleusprog",
+    "sketch": "PlantTimer1.ino"
+}
