@@ -13,16 +13,22 @@
 #include <avr/sleep.h>
 #include <avr/wdt.h>
 #include <avr/interrupt.h>
+#include <avr/power.h>
 
 #define LEDPIN 0 // Define LED pin as PB0 (digital pin 0)
 #define BUTTONPIN 4 // Define button pin as PB4 (digital pin 4)
 #define SWITCHPIN 3 // Define switch pin as PB3 (analog pin 3)
 
+#define WDT_INTERVAL 8.5 // Adjusted WDT interval in seconds
+
 volatile bool watchdog_wake = false;
-volatile unsigned long wake_count = 0;
+volatile unsigned long wake_count = 11000;
 volatile bool button_pressed = false;
 
 void setup() {
+  // Disable ADC to save power
+  ADCSRA &= ~(1 << ADEN);
+
   pinMode(LEDPIN, OUTPUT);
   pinMode(BUTTONPIN, INPUT_PULLUP); // Set button pin as input with internal pull-up resistor
   pinMode(SWITCHPIN, INPUT); // Set switch pin as input
@@ -102,15 +108,21 @@ ISR(PCINT0_vect) {
 
 // Function to get the wake count threshold based on the switch position
 unsigned long getWakeCountThreshold() {
-  int switchValue = analogRead(SWITCHPIN);
-  if (switchValue < 341) { // Corresponds to 200K resistor
-    return 60 / 8; // 5 seconds (assuming watchdog timer interval is 8 seconds)
-  } else if (switchValue < 682) { // Corresponds to 1M resistor
-    return 60 / 8; // 1 minute
-  } else if (switchValue <= 1023) { // Corresponds to 5M resistor
-    return 60 / 8; // 10 minutes
-  } else {
-    // Default case if reading fails or is out of range
-    return 60 / 8; // Default to 1 minute
-  }
+    // Enable ADC for reading the switch pin
+    ADCSRA |= (1 << ADEN);
+
+    int switchValue = analogRead(SWITCHPIN);
+
+    // Disable ADC after reading to save power
+    ADCSRA &= ~(1 << ADEN);
+
+    if (switchValue < 341) {
+        return (86400 / WDT_INTERVAL); // 1 hour
+    } else if (switchValue < 682) {
+        return (60 / WDT_INTERVAL); // 1 minute
+    } else if (switchValue <= 1023) {
+        return (8 / WDT_INTERVAL); // 8 seconds
+    } else {
+        return (60 / WDT_INTERVAL); // Default to 1 minute
+    }
 }
