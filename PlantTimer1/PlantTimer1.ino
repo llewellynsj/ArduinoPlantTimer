@@ -104,11 +104,11 @@ ISR(PCINT0_vect) {
 unsigned long getWakeCountThreshold() {
   int switchValue = analogRead(SWITCHPIN);
   if (switchValue < 341) { // Corresponds to 200K resistor
-    return 8 / 8; // 5 seconds (assuming watchdog timer interval is 8 seconds)
+    return 60 / 8; // 5 seconds (assuming watchdog timer interval is 8 seconds)
   } else if (switchValue < 682) { // Corresponds to 1M resistor
     return 60 / 8; // 1 minute
   } else if (switchValue <= 1023) { // Corresponds to 5M resistor
-    return 600 / 8; // 10 minutes
+    return 60 / 8; // 10 minutes
   } else {
     // Default case if reading fails or is out of range
     return 60 / 8; // Default to 1 minute
