@@ -19,11 +19,12 @@
 #define BUTTONPIN 4 // Define button pin as PB4 (digital pin 4)
 #define SWITCHPIN 3 // Define switch pin as PB3 (analog pin 3)
 
-#define WDT_INTERVAL 8.5 // Adjusted WDT interval in seconds
+#define WDT_INTERVAL_TENTHS 85 // Adjusted WDT interval in seconds
 
 volatile bool watchdog_wake = false;
-volatile unsigned long wake_count = 11000;
+volatile unsigned long wake_count = 0;
 volatile bool button_pressed = false;
+volatile bool first_power_on = true;
 
 void setup() {
   // Disable ADC to save power
@@ -42,6 +43,22 @@ void setup() {
 }
 
 void loop() {
+    if (first_power_on) {
+    first_power_on = false;
+    digitalWrite(LEDPIN, HIGH);
+
+    // Wait for the button to be pressed
+    while (!button_pressed) {
+      set_sleep_mode(SLEEP_MODE_IDLE);
+      sleep_enable();
+      sleep_mode();
+      sleep_disable();
+    }
+
+    digitalWrite(LEDPIN, LOW);
+    button_pressed = false;
+    wake_count = 0; // Reset the wake count
+  }
   // If we've reached the wake_count threshold
   if (wake_count >= getWakeCountThreshold()) {
     // Turn on the LED
@@ -117,12 +134,12 @@ unsigned long getWakeCountThreshold() {
     ADCSRA &= ~(1 << ADEN);
 
     if (switchValue < 341) {
-        return (86400 / WDT_INTERVAL); // 1 hour
+        return ((86400 * 10) / WDT_INTERVAL_TENTHS); // 1 hour
     } else if (switchValue < 682) {
-        return (60 / WDT_INTERVAL); // 1 minute
+        return ((60 * 10) / WDT_INTERVAL_TENTHS); // 1 minute
     } else if (switchValue <= 1023) {
-        return (8 / WDT_INTERVAL); // 8 seconds
+        return ((8 * 10) / WDT_INTERVAL_TENTHS); // 8 seconds
     } else {
-        return (60 / WDT_INTERVAL); // Default to 1 minute
+        return ((60 * 10) / WDT_INTERVAL_TENTHS); // Default to 1 minute
     }
 }
