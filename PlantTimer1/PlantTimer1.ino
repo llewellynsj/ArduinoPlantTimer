@@ -19,7 +19,7 @@
 #define BUTTONPIN 4 // Define button pin as PB4 (digital pin 4)
 #define SWITCHPIN 3 // Define switch pin as PB3 (analog pin 3)
 
-#define WDT_INTERVAL_TENTHS 85 // Adjusted WDT interval in seconds
+#define WDT_INTERVAL_TENTHS 85 // Adjusted WDT interval in tenths of a second
 
 volatile bool watchdog_wake = false;
 volatile unsigned long wake_count = 0;
@@ -43,7 +43,7 @@ void setup() {
 }
 
 void loop() {
-    if (first_power_on) {
+  if (first_power_on) {
     first_power_on = false;
     digitalWrite(LEDPIN, HIGH);
 
@@ -55,10 +55,13 @@ void loop() {
       sleep_disable();
     }
 
+    // Turn off the LED
     digitalWrite(LEDPIN, LOW);
+
+    // Reset the button press flag
     button_pressed = false;
-    wake_count = 0; // Reset the wake count
   }
+
   // If we've reached the wake_count threshold
   if (wake_count >= getWakeCountThreshold()) {
     // Turn on the LED
@@ -67,6 +70,7 @@ void loop() {
     // Wait for the button to be pressed
     while (!button_pressed) {
       // Enter idle sleep mode
+      // breatheLED(); // Call the breatheLED function
       set_sleep_mode(SLEEP_MODE_IDLE);
       sleep_enable();
       sleep_mode();
@@ -117,29 +121,49 @@ ISR(WDT_vect) {
 
 // Pin change interrupt service routine
 ISR(PCINT0_vect) {
-  if (digitalRead(BUTTONPIN) == LOW) {
-    button_pressed = true;
-    wake_count = 0; // Reset the wake count
-  }
+    if (digitalRead(BUTTONPIN) == LOW) {
+      button_pressed = true;
+      wake_count = 0; // Reset the wake count
+    }
 }
+
 
 // Function to get the wake count threshold based on the switch position
 unsigned long getWakeCountThreshold() {
-    // Enable ADC for reading the switch pin
-    ADCSRA |= (1 << ADEN);
+  // Enable ADC for reading the switch pin
+  ADCSRA |= (1 << ADEN);
+  delay(1); // Allow ADC to stabilize
+  int switchValue = analogRead(SWITCHPIN);
 
-    int switchValue = analogRead(SWITCHPIN);
+  // Disable ADC after reading to save power
+  ADCSRA &= ~(1 << ADEN);
 
-    // Disable ADC after reading to save power
-    ADCSRA &= ~(1 << ADEN);
+  if (switchValue < 341) {
+    return ((86400 * 10) / WDT_INTERVAL_TENTHS); // 1 hour
+  } else if (switchValue < 682) {
+    return ((60 * 10) / WDT_INTERVAL_TENTHS); // 1 minute
+  } else if (switchValue <= 1023) {
+    return ((8 * 10) / WDT_INTERVAL_TENTHS); // 8 seconds
+  } else {
+    return ((60 * 10) / WDT_INTERVAL_TENTHS); // Default to 1 minute
+  }
+}
 
-    if (switchValue < 341) {
-        return ((86400 * 10) / WDT_INTERVAL_TENTHS); // 1 hour
-    } else if (switchValue < 682) {
-        return ((60 * 10) / WDT_INTERVAL_TENTHS); // 1 minute
-    } else if (switchValue <= 1023) {
-        return ((8 * 10) / WDT_INTERVAL_TENTHS); // 8 seconds
-    } else {
-        return ((60 * 10) / WDT_INTERVAL_TENTHS); // Default to 1 minute
-    }
+void breatheLED() {
+  static const uint8_t sineWave[64] = {
+    140, 152, 165, 176, 188, 198, 208, 218, 226, 234, 240, 245, 250, 253, 254, 255,
+    254, 253, 250, 245, 240, 234, 226, 218, 208, 198, 188, 176, 165, 152, 140, 128,
+    115, 103, 90, 79, 67, 57, 47, 37, 29, 21, 15, 10, 5, 2, 1, 0,
+    1, 2, 5, 10, 15, 21, 29, 37, 47, 57, 67, 79, 90, 103, 115, 128
+  };
+
+  static uint8_t index = 0;
+  static unsigned long lastUpdate = 0;
+  const unsigned int delayTime = 60;
+
+  if (millis() - lastUpdate >= delayTime) {
+    analogWrite(LEDPIN, sineWave[index]);
+    index = (index + 1) % 64; // Loop through the sine wave
+    lastUpdate = millis();
+  }
 }
