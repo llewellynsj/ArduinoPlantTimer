@@ -1,169 +1,275 @@
 /*
- * File: PlantTimer1.ino
- * Description: Prototype code for a personal project using an ATtiny85.
- * This code is intended to control an LED and a button. The LED turns on after
- * a certain period and stays on until the button is pressed. The device uses
- * sleep modes to conserve power.
- * 
+ * File: PlantTimer_v2_Internal.ino
+ * Description: Version 2 of the Plant Timer using ATtiny85 Internal WDT.
+ * - Replaces 'goto' logic with a State Machine.
+ * - Adds Calibration to compensate for WDT drift.
+ * - Adds visual feedback (blinks) on start to confirm settings.
+ *
  * Microcontroller: ATtiny85
- * Author: Llewellyn Sims Johns
- * Date: 12 Jan 2025
+ * Author: Gemini (Refactoring original concept)
+ * Date: 15 Dec 2025
  */
 
-#include <avr/sleep.h>
-#include <avr/wdt.h>
-#include <avr/interrupt.h>
-#include <avr/power.h>
+#include <avr/sleep.h>      // Sleep modes
+#include <avr/wdt.h>        // Watchdog Timer
+#include <avr/interrupt.h>  // Interrupts (ISR)
+#include <avr/power.h>      // Power management
 
-#define LEDPIN 0 // Define LED pin as PB0 (digital pin 0)
-#define BUTTONPIN 4 // Define button pin as PB4 (digital pin 4)
-#define SWITCHPIN 3 // Define switch pin as PB3 (analog pin 3)
+// =========================================================================
+// --- USER CONFIGURATION & CALIBRATION ---
+// =========================================================================
 
-#define WDT_INTERVAL_TENTHS 85 // Adjusted WDT interval in tenths of a second
+// 1. PIN DEFINITIONS
+#define LED_PIN     PB0  // Pin 5 on DIP8
+#define SWITCH_PIN  PB3  // Pin 2 on DIP8 (Analog Input)
+#define BUTTON_PIN  PB4  // Pin 3 on DIP8
 
-volatile bool watchdog_wake = false;
-volatile unsigned long wake_count = 0;
-volatile bool button_pressed = false;
-volatile bool first_power_on = true;
+// 2. TIMING SETTINGS (Days)
+#define DAYS_SHORT   1UL
+#define DAYS_MEDIUM  5UL
+#define DAYS_LONG    10UL
 
+// 3. CALIBRATION (The Magic Number)
+// The WDT is nominally 8.0 seconds, but often runs faster or slower.
+// If your timer is finishing TOO FAST, decrease this number (e.g., 7.8).
+// If your timer is finishing TOO SLOW, increase this number (e.g., 8.2).
+// Formula: New_Cal = Current_Cal * (Actual_Time_Elapsed / Target_Time)
+#define WDT_CALIBRATED_SECONDS  8.0 
+
+// =========================================================================
+// --- SYSTEM CONSTANTS & VARIABLES ---
+// =========================================================================
+
+// ADC Thresholds for the 3-position switch (0-1023 scale)
+#define ADC_THRES_LOW   340  // Lower third
+#define ADC_THRES_HIGH  680  // Upper third
+
+// State Machine States
+enum TimerState {
+    STATE_STARTUP,      // Initial power on, read settings, blink LED
+    STATE_SLEEPING,     // Deep sleep, counting down WDT cycles
+    STATE_ALARM,        // Timer finished, LED ON, waiting for user
+    STATE_RESET_WAIT    // Handling button press to reset
+};
+
+TimerState currentState = STATE_STARTUP;
+
+// Volatile flags set by Interrupt Service Routines (ISRs)
+volatile bool flag_wdt_tick = false;
+volatile bool flag_button_press = false;
+
+// Timing counters
+unsigned long wake_cycles_counter = 0;
+unsigned long target_wake_cycles = 0;
+
+// Function Prototypes
+void setupWDT();
+void sleepDeep();
+void sleepIdle();
+unsigned long calculateTargetCycles(unsigned long days);
+int readSwitchMode();
+void blinkIndicator(int times);
+
+// =========================================================================
+// SETUP
+// =========================================================================
 void setup() {
-  // Disable ADC to save power
-  ADCSRA &= ~(1 << ADEN);
+    // 1. Configure Pins
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+    
+    pinMode(BUTTON_PIN, INPUT_PULLUP); 
+    pinMode(SWITCH_PIN, INPUT); 
 
-  pinMode(LEDPIN, OUTPUT);
-  pinMode(BUTTONPIN, INPUT_PULLUP); // Set button pin as input with internal pull-up resistor
-  pinMode(SWITCHPIN, INPUT); // Set switch pin as input
+    // 2. Power Saving (Disable unused peripherals)
+    ADCSRA &= ~(1 << ADEN); // Disable ADC
+    power_adc_disable();
+    
+    // 3. Setup Interrupts
+    // Enable Pin Change Interrupt on PB4 (Button)
+    GIMSK |= (1 << PCIE);
+    PCMSK |= (1 << PCINT4);
 
-  // Enable pin change interrupt on BUTTONPIN
-  GIMSK |= (1 << PCIE); // Enable pin change interrupts
-  PCMSK |= (1 << BUTTONPIN); // Enable pin change interrupt for BUTTONPIN
+    // 4. Setup Watchdog
+    setupWDT();
 
-  // Setup Watchdog Timer
-  setupWatchdogTimer();
+    // Enable Global Interrupts
+    sei();
 }
 
+// =========================================================================
+// MAIN LOOP (State Machine)
+// =========================================================================
 void loop() {
-  if (first_power_on) {
-    first_power_on = false;
-    digitalWrite(LEDPIN, HIGH);
+    switch (currentState) {
+        
+        // --- CASE: STARTUP / RESET ---
+        case STATE_STARTUP: {
+            // 1. Read the switch to determine duration
+            int mode = readSwitchMode(); // Returns 1 (Short), 2 (Medium), or 3 (Long)
+            
+            // 2. Calculate how many 8-second cycles we need
+            unsigned long days = 0;
+            if (mode == 1) days = DAYS_SHORT;
+            else if (mode == 2) days = DAYS_MEDIUM;
+            else days = DAYS_LONG;
+            
+            target_wake_cycles = calculateTargetCycles(days);
+            wake_cycles_counter = 0;
 
-    // Wait for the button to be pressed
-    while (!button_pressed) {
-      set_sleep_mode(SLEEP_MODE_IDLE);
-      sleep_enable();
-      sleep_mode();
-      sleep_disable();
+            // 3. Visual Feedback: Blink LED to confirm setting
+            // 1 Blink = Short, 2 Blinks = Medium, 3 Blinks = Long
+            blinkIndicator(mode);
+
+            // 4. Reset flags and transition to sleep
+            flag_button_press = false;
+            flag_wdt_tick = false;
+            currentState = STATE_SLEEPING;
+            break;
+        }
+
+        // --- CASE: SLEEPING (COUNTDOWN) ---
+        case STATE_SLEEPING: {
+            // Check if button was pressed during sleep
+            if (flag_button_press) {
+                // Debounce check
+                delay(50); 
+                if (digitalRead(BUTTON_PIN) == LOW) {
+                    // Valid press: Reset timer
+                    blinkIndicator(1); // Short blink to acknowledge
+                    currentState = STATE_STARTUP;
+                }
+                flag_button_press = false; // Clear flag
+            }
+            // Check if Watchdog woke us up
+            else if (flag_wdt_tick) {
+                flag_wdt_tick = false; // Clear flag
+                wake_cycles_counter++;
+                
+                // Check if we reached the target
+                if (wake_cycles_counter >= target_wake_cycles) {
+                    currentState = STATE_ALARM;
+                } else {
+                    // Go back to sleep
+                    sleepDeep();
+                }
+            } 
+            else {
+                // If we are here and no flags are set, just sleep
+                sleepDeep();
+            }
+            break;
+        }
+
+        // --- CASE: ALARM (WATER ME!) ---
+        case STATE_ALARM: {
+            digitalWrite(LED_PIN, HIGH); // Turn LED ON
+
+            // We use Idle sleep here to save power while keeping the LED on.
+            // Only a button press (Interrupt) will wake us fully.
+            if (flag_button_press) {
+                 // Debounce
+                delay(50);
+                if (digitalRead(BUTTON_PIN) == LOW) {
+                    // User acknowledged alarm
+                    digitalWrite(LED_PIN, LOW);
+                    currentState = STATE_STARTUP; // Restart cycle
+                }
+                flag_button_press = false;
+            } else {
+                sleepIdle();
+            }
+            break;
+        }
     }
+}
 
-    // Turn off the LED
-    digitalWrite(LEDPIN, LOW);
+// =========================================================================
+// HELPERS & LOGIC
+// =========================================================================
 
-    // Reset the button press flag
-    button_pressed = false;
-  }
+// Calculates the number of WDT cycles needed for X days
+unsigned long calculateTargetCycles(unsigned long days) {
+    // Total seconds needed
+    unsigned long totalSeconds = days * 24UL * 3600UL;
+    // Divide by calibrated WDT interval
+    return (unsigned long)(totalSeconds / WDT_CALIBRATED_SECONDS);
+}
 
-  // If we've reached the wake_count threshold
-  if (wake_count >= getWakeCountThreshold()) {
-    // Turn on the LED
-    digitalWrite(LEDPIN, HIGH);
+// Reads the analog switch (enables ADC temporarily)
+int readSwitchMode() {
+    power_adc_enable();
+    ADCSRA |= (1 << ADEN); // Enable ADC
 
-    // Wait for the button to be pressed
-    while (!button_pressed) {
-      // Enter idle sleep mode
-      // breatheLED(); // Call the breatheLED function
-      set_sleep_mode(SLEEP_MODE_IDLE);
-      sleep_enable();
-      sleep_mode();
-      // The program will continue from here after waking up
-      sleep_disable();
+    // ADMUX Config: Vcc Ref, ADC3 (PB3)
+    ADMUX = (0 << REFS1) | (0 << REFS0) | (0 << ADLAR) | (1 << MUX1) | (1 << MUX0);
+    delay(2); // Settling time
+
+    ADCSRA |= (1 << ADSC); // Start conversion
+    while (bit_is_set(ADCSRA, ADSC)); // Wait
+    int val = ADC;
+
+    ADCSRA &= ~(1 << ADEN); // Disable ADC
+    power_adc_disable();
+
+    if (val < ADC_THRES_LOW) return 1;      // Short
+    else if (val < ADC_THRES_HIGH) return 2;// Medium
+    else return 3;                          // Long
+}
+
+// Blinks the LED 'times' times
+void blinkIndicator(int times) {
+    for (int i = 0; i < times; i++) {
+        digitalWrite(LED_PIN, HIGH);
+        delay(200);
+        digitalWrite(LED_PIN, LOW);
+        delay(200);
     }
-
-    // Turn off the LED
-    digitalWrite(LEDPIN, LOW);
-
-    // Reset the button press flag
-    button_pressed = false;
-  }
-
-  // Go to sleep
-  goToSleep();
 }
 
-// Setup the Watchdog Timer to wake up every 8 seconds
-void setupWatchdogTimer() {
-  cli(); // Disable interrupts
+// =========================================================================
+// LOW LEVEL & SLEEP
+// =========================================================================
 
-  // Set the Watchdog Timer to 8 seconds
-  wdt_reset();
-  WDTCR |= (1 << WDCE) | (1 << WDE);
-  WDTCR = (1 << WDP3) | (1 << WDP0); // 8 seconds
-  WDTCR |= (1 << WDIE); // Enable Watchdog Timer interrupt
-
-  sei(); // Enable interrupts
+void setupWDT() {
+    cli();
+    wdt_reset();
+    // Enable WDT configuration change
+    WDTCR |= (1 << WDCE) | (1 << WDE);
+    // Set Interrupt Mode (WDIE) and ~8s interval (WDP3+WDP0)
+    WDTCR = (1 << WDIE) | (1 << WDP3) | (1 << WDP0);
+    sei();
 }
 
-void goToSleep() {
-  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-  sleep_enable();
-
-  // Go to sleep
-  sleep_mode();
-
-  // The program will continue from here after waking up
-  sleep_disable(); // First thing to do after waking up
+void sleepDeep() {
+    set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+    sleep_enable();
+    sei();       // Ensure interrupts are enabled
+    sleep_cpu(); // Goodnight
+    sleep_disable();
 }
 
-// Watchdog Timer interrupt service routine
+void sleepIdle() {
+    set_sleep_mode(SLEEP_MODE_IDLE); // Keeps peripherals (timers/PWM) running if needed
+    sleep_enable();
+    sei();
+    sleep_cpu();
+    sleep_disable();
+}
+
+// =========================================================================
+// INTERRUPTS
+// =========================================================================
+
+// Watchdog Vector
 ISR(WDT_vect) {
-  watchdog_wake = true;
-  wake_count++;
+    flag_wdt_tick = true;
 }
 
-// Pin change interrupt service routine
+// Pin Change Vector (Button)
 ISR(PCINT0_vect) {
-    if (digitalRead(BUTTONPIN) == LOW) {
-      button_pressed = true;
-      wake_count = 0; // Reset the wake count
+    // Check if Button (PB4) is LOW
+    if (!(PINB & (1 << BUTTON_PIN))) {
+        flag_button_press = true;
     }
-}
-
-
-// Function to get the wake count threshold based on the switch position
-unsigned long getWakeCountThreshold() {
-  // Enable ADC for reading the switch pin
-  ADCSRA |= (1 << ADEN);
-  delay(1); // Allow ADC to stabilize
-  int switchValue = analogRead(SWITCHPIN);
-
-  // Disable ADC after reading to save power
-  ADCSRA &= ~(1 << ADEN);
-
-  if (switchValue < 341) {
-    return ((86400 * 10) / WDT_INTERVAL_TENTHS); // 1 hour
-  } else if (switchValue < 682) {
-    return ((60 * 10) / WDT_INTERVAL_TENTHS); // 1 minute
-  } else if (switchValue <= 1023) {
-    return ((8 * 10) / WDT_INTERVAL_TENTHS); // 8 seconds
-  } else {
-    return ((60 * 10) / WDT_INTERVAL_TENTHS); // Default to 1 minute
-  }
-}
-
-void breatheLED() {
-  static const uint8_t sineWave[64] = {
-    140, 152, 165, 176, 188, 198, 208, 218, 226, 234, 240, 245, 250, 253, 254, 255,
-    254, 253, 250, 245, 240, 234, 226, 218, 208, 198, 188, 176, 165, 152, 140, 128,
-    115, 103, 90, 79, 67, 57, 47, 37, 29, 21, 15, 10, 5, 2, 1, 0,
-    1, 2, 5, 10, 15, 21, 29, 37, 47, 57, 67, 79, 90, 103, 115, 128
-  };
-
-  static uint8_t index = 0;
-  static unsigned long lastUpdate = 0;
-  const unsigned int delayTime = 60;
-
-  if (millis() - lastUpdate >= delayTime) {
-    analogWrite(LEDPIN, sineWave[index]);
-    index = (index + 1) % 64; // Loop through the sine wave
-    lastUpdate = millis();
-  }
 }
